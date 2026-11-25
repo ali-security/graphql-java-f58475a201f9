@@ -1,8 +1,5 @@
 name: invoke_test_runner
 on:
-  push:
-    branches:
-      - master
   workflow_dispatch:
     inputs:
       BRANCH_INPUT:

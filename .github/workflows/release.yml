@@ -6,10 +6,16 @@ on:
       version:
         description: 'the version to be released'
         required: true
+        default: '21.5'
+      test-filter:
+        description: 'Gradle test task + filter to run instead of the full check (empty = full suite)'
+        required: false
+        default: ''
 
 jobs:
   buildAndPublish:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     env:
       MAVEN_CENTRAL_PGP_KEY: ${{ secrets.MAVEN_CENTRAL_PGP_KEY }}
       MAVEN_CENTRAL_USER: ${{ secrets.MAVEN_CENTRAL_USER }}
@@ -24,5 +30,84 @@ jobs:
         with:
           java-version: '11'
           distribution: 'corretto'
-      - name: build test and publish
-        run: ./gradlew assemble && ./gradlew check --info && ./gradlew publishToSonatype closeAndReleaseSonatypeStagingRepository -x check --info --stacktrace
+          cache: 'gradle'
+      - name: build and test
+        run: |
+          if [ -n "${{ inputs.test-filter }}" ]; then
+            ./gradlew assemble --no-build-cache && ./gradlew ${{ inputs.test-filter }} --info --no-build-cache
+          else
+            ./gradlew assemble --no-build-cache && ./gradlew check --info --no-build-cache
+          fi
+      - name: publish to local maven repo (shadowJar runs as part of the publication; no Sonatype credentials on the fork)
+        run: ./gradlew publishToMavenLocal -x signGraphqlJavaPublication -x check --info --stacktrace --no-build-cache
+      - name: Upload release jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: graphql-java-jar
+          path: build/libs/graphql-java-${{ github.event.inputs.version }}.jar
+          if-no-files-found: error
+      - name: Test summary
+        if: always()
+        run: |
+          python3 - <<'EOF'
+          import glob, os, re
+          import xml.etree.ElementTree as ET
+          # reactive-streams-tck 1.0.3 PublisherVerification throws SkipException with these messages;
+          # Gradle's XML report drops the message, so map them by TCK rule prefix.
+          TCK = [
+              ('untested_', 'reactive-streams TCK notVerified(): "Not verified by this TCK." (rule is untestable by the TCK)'),
+              ('optional_spec111', 'reactive-streams TCK: "Skipped because tested publisher does NOT implement this OPTIONAL requirement." (SingleSubscriberPublisher allows one subscriber; multi-subscribe is optional)'),
+              ('required_spec317', 'reactive-streams TCK activePublisherTest: "Unable to run this test, as required elements nr: 2147483647 is higher than supported by given producer: 10000" (maxElementsFromPublisher()=10000)'),
+          ]
+          def annotated_reason(lines, idx):
+              notes, ignore = [], None
+              i = idx - 1
+              while i >= 0:
+                  l = lines[i].strip()
+                  if l.startswith('@Ignore'):
+                      m = re.search(r'@Ignore\s*\(\s*["\'](.*)["\']\s*\)', l)
+                      ignore = '@Ignore' + (f'("{m.group(1)}")' if m else '')
+                  elif l.startswith(('//', '*', '/**', '*/')) and l.strip('/* '):
+                      notes.insert(0, l.strip('/* '))
+                  elif l and not l.startswith('@') and not l.startswith(('*', '/')):
+                      break
+                  i -= 1
+              return ignore, ' '.join(notes)
+          def reason_for(cls, name):
+              for prefix, msg in TCK:
+                  if cls.endswith('TckVerificationTest') and name.startswith(prefix):
+                      return msg
+              src = os.path.join('src/test/groovy', *cls.split('.')) + '.groovy'
+              if os.path.exists(src):
+                  lines = open(src, encoding='utf-8').read().splitlines()
+                  for idx, l in enumerate(lines):
+                      if re.search(r'def\s+["\']' + re.escape(name) + r'["\']', l):
+                          ign, note = annotated_reason(lines, idx)
+                          if ign:
+                              return f'{ign} on feature in {src}' + (f' -- comment: {note}' if note else '')
+                          break
+                  for idx, l in enumerate(lines):
+                      if re.match(r'\s*class\s+' + re.escape(cls.split('.')[-1]) + r'\b', l):
+                          ign, note = annotated_reason(lines, idx)
+                          if ign:
+                              return f'{ign} on whole spec class in {src}' + (f' -- javadoc: {note}' if note else '')
+              return 'skipped by runner (no source annotation found)'
+          total = failed = skipped = 0
+          by_reason = {}
+          for f in sorted(glob.glob('build/test-results/**/*.xml', recursive=True)):
+              for tc in ET.parse(f).getroot().iter('testcase'):
+                  total += 1
+                  if tc.find('failure') is not None or tc.find('error') is not None:
+                      failed += 1
+                      continue
+                  s = tc.find('skipped')
+                  if s is not None:
+                      skipped += 1
+                      reason = (s.get('message') or '').strip() or reason_for(tc.get('classname'), tc.get('name'))
+                      by_reason.setdefault(reason[:400], []).append(f"{tc.get('classname')}.{tc.get('name')}")
+          print('==== Skipped tests by reason ====')
+          for reason, names in by_reason.items():
+              print(f'SKIPPED reason="{reason}" count={len(names)}: ' + '; '.join(names)[:1500])
+          print('==== Test summary (build/test-results: test + testng) ====')
+          print(f'Tests run: {total}, Passed: {total - failed - skipped}, Failed: {failed}, Skipped: {skipped}')
+          EOF

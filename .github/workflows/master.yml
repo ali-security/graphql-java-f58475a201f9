@@ -1,9 +1,7 @@
 name: Master Build and Publish
 # For master push: Builds and publishes the development version to maven
 on:
-  push:
-    branches:
-      - master
+  workflow_dispatch:
 jobs:
   buildAndPublish:
     runs-on: ubuntu-latest
